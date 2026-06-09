@@ -2,16 +2,16 @@
 """
 localisation.py  —  EKF con odometría + corrección ArUco
 =========================================================
-Paso de predicción : odometría de encoders  (L_k dinámica)
-Paso de corrección : detecciones ArUco      (R_k con bias)
+Paso de predicción : odometría de encoders  (L_k dinámica, modelo exacto)
+Paso de corrección : detecciones ArUco      (Float32MultiArray)
+
+Mejoras respecto a versión anterior:
+  - Modelo cinemático exacto: v/w*(sin(θ+w·dt)-sin(θ)) en lugar de aproximación
+  - Parsing robusto de Float32MultiArray [id, d_k, alpha_k, ...]
+  - Mismo filtro de aruco_map (solo IDs conocidos)
 
 Mapa de ArUcos — parámetro 'aruco_map' en formato JSON:
-  '{"0": [1.0, 0.0], "1": [2.0, 1.5], "2": [0.0, 2.0]}'
-  clave = ID del marcador (string), valor = [x_mi, y_mi] en metros
-
-Corrección de bias de la cámara (caracterizada experimentalmente):
-  d_corr     = d_k / (1 + BIAS_D)   →  1.2246
-  alpha_corr = alpha_k / (1 + BIAS_A) →  0.6105
+  '{"1": [1.6, 0.0], "2": [0.0, 1.6]}'
 """
 
 import rclpy, math, json
@@ -46,63 +46,55 @@ class Localisation(Node):
         self.declare_parameter('K_L',              0.01332)
         self.declare_parameter('use_clock_topic',  False)
 
-        # Ruido de observación de la cámara (R_k fija — de la caracterización)
-        self.declare_parameter('r_dd',             0.000016)   # σ²_d
-        self.declare_parameter('r_aa',             0.000001)   # σ²_α
-        self.declare_parameter('r_da',             0.0)        # covarianza cruzada
+        # Ruido de observación de la cámara
+        self.declare_parameter('r_dd',             0.01)    # σ²_d
+        self.declare_parameter('r_aa',             0.01)    # σ²_α
 
-        # Mapa de ArUcos: JSON  {"id": [x_mi, y_mi], ...}
-        self.declare_parameter('aruco_map',
-                               '{"0": [1.0, 0.0]}')
+        # Mapa de ArUcos: JSON {"id": [x_mi, y_mi], ...}
+        self.declare_parameter('aruco_map', '{"0": [1.0, 0.0]}')
 
         # ── Leer parámetros ──────────────────────────────────────────────
-        self.rate         = self.get_parameter('rate').value
-        child_frame       = self.get_parameter('child_frame_id').value
-        cov_x             = self.get_parameter('cov_x').value
-        cov_y             = self.get_parameter('cov_y').value
-        cov_yaw           = self.get_parameter('cov_yaw').value
-        self.K_R          = self.get_parameter('K_R').value
-        self.K_L          = self.get_parameter('K_L').value
+        self.rate            = self.get_parameter('rate').value
+        child_frame          = self.get_parameter('child_frame_id').value
+        cov_x                = self.get_parameter('cov_x').value
+        cov_y                = self.get_parameter('cov_y').value
+        cov_yaw              = self.get_parameter('cov_yaw').value
+        self.K_R             = self.get_parameter('K_R').value
+        self.K_L             = self.get_parameter('K_L').value
         self.use_clock_topic = self.get_parameter('use_clock_topic').value
 
         r_dd = self.get_parameter('r_dd').value
         r_aa = self.get_parameter('r_aa').value
-        r_da = self.get_parameter('r_da').value
-        self.Rk = np.matrix([[r_dd, r_da],
-                             [r_da, r_aa]])
+        self.Rk = np.array([[r_dd, 0.0 ],
+                             [0.0,  r_aa]], dtype=float)
 
-        # Mapa ArUcos: {int_id: np.array([x_mi, y_mi])}
         raw_map = json.loads(self.get_parameter('aruco_map').value)
         self.aruco_map = {int(k): np.array(v) for k, v in raw_map.items()}
-        self.get_logger().info(f'Mapa ArUcos cargado: {self.aruco_map}')
 
-        # Advertencia si el aruco_map tiene múltiples marcadores — OK
-        # Advertencia si aruco_map está vacío
         if not self.aruco_map:
             self.get_logger().warn(
-                'aruco_map está vacío — el EKF solo usará odometría sin corrección ArUco')
+                'aruco_map vacío — EKF solo usará odometría')
         else:
             self.get_logger().info(
-                f'{len(self.aruco_map)} ArUco(s) de localización registrados: '
+                f'{len(self.aruco_map)} ArUco(s) de localización: '
                 f'{list(self.aruco_map.keys())} | '
-                f'Cualquier otro ID detectado será ignorado automáticamente.')
-
-        # ── Bias de cámara (caracterizado experimentalmente) ─────────────
-        self.BIAS_D = 0.2246    # d_corr     = d_k / 1.2246
-        self.BIAS_A = -0.3895   # alpha_corr = alpha_k / 0.6105
+                f'IDs desconocidos ignorados automáticamente.')
 
         # ── Estado inicial ───────────────────────────────────────────────
         self.x     = self.get_parameter('x0').value
         self.y     = self.get_parameter('y0').value
         self.theta = self.get_parameter('theta0').value
 
-        self.Ek = np.matrix([[cov_x, 0.0,   0.0    ],
-                             [0.0,   cov_y, 0.0    ],
-                             [0.0,   0.0,   cov_yaw]])
-        self.Lk = np.zeros((2, 2))
+        self.Ek = np.zeros((3, 3), dtype=float)
+        self.Ek[0, 0] = cov_x
+        self.Ek[1, 1] = cov_y
+        self.Ek[2, 2] = cov_yaw
 
-        # ── ROS — publishers / subscribers ──────────────────────────────
+        self.Lk = np.zeros((2, 2), dtype=float)
+
+        # ── ROS ──────────────────────────────────────────────────────────
         self.odom_pub = self.create_publisher(Odometry, 'odom', 10)
+
         self.create_subscription(Float32, 'VelocityEncR',
                                  self._enc_r_cb, qos_vel)
         self.create_subscription(Float32, 'VelocityEncL',
@@ -112,8 +104,7 @@ class Localisation(Node):
         self.create_subscription(Float32MultiArray, '/aruco_detections',
                                  self._aruco_cb, 10)
 
-        # Buffer de detecciones ArUco — se procesa en timer_callback
-        self._aruco_buf = []   # lista de (id, d_k, alpha_k)
+        self._aruco_buf = []
 
         # ── TF ───────────────────────────────────────────────────────────
         self.tf_msg = TransformStamped()
@@ -132,7 +123,7 @@ class Localisation(Node):
         self.t0_ns    = 0
         self.t0       = self.get_clock().now()
 
-        # ── Odometry msg ─────────────────────────────────────────────────
+        # ── Odom msg ─────────────────────────────────────────────────────
         self.odom = Odometry()
         self.odom.header.frame_id = 'world'
         self.odom.child_frame_id  = child_frame
@@ -141,18 +132,22 @@ class Localisation(Node):
 
         src = '/clock topic' if self.use_clock_topic else 'wall clock'
         self.get_logger().info(
-            f'Localisation+EKF iniciado | time={src} | '
+            f'Localisation+EKF | time={src} | '
             f'K_R={self.K_R:.5f} K_L={self.K_L:.5f} | '
             f'ArUcos={list(self.aruco_map.keys())}')
 
-    # ── Callbacks de sensores ────────────────────────────────────────────
-    def _enc_r_cb(self, msg):  self.wr = msg.data
-    def _enc_l_cb(self, msg):  self.wl = msg.data
+    # ── Callbacks ─────────────────────────────────────────────────────────
+    def _enc_r_cb(self, msg): self.wr = msg.data
+    def _enc_l_cb(self, msg): self.wl = msg.data
+
     def _clock_cb(self, msg):
         self.clock_ns = msg.clock.sec * 1_000_000_000 + msg.clock.nanosec
 
     def _aruco_cb(self, msg: Float32MultiArray):
-        """Acumula detecciones ArUco en el buffer para procesarlas en el timer."""
+        """
+        Formato: [id0, d_k0, alpha_k0,  id1, d_k1, alpha_k1, ...]
+        Solo acumula los IDs que están en aruco_map.
+        """
         data = msg.data
         detections = []
         for i in range(0, len(data) - 2, 3):
@@ -161,12 +156,12 @@ class Localisation(Node):
             alpha_k   = float(data[i + 2])
             if marker_id in self.aruco_map:
                 detections.append((marker_id, d_k, alpha_k))
-        self._aruco_buf = detections   # reemplaza — solo usamos el frame más reciente
+        self._aruco_buf = detections
 
-    # ── Timer principal ──────────────────────────────────────────────────
+    # ── Timer principal ────────────────────────────────────────────────────
     def timer_callback(self):
 
-        # ── Tiempo ───────────────────────────────────────────────────────
+        # ── Tiempo ──────────────────────────────────────────────────────
         if self.use_clock_topic:
             if self.clock_ns == 0:
                 return
@@ -184,133 +179,125 @@ class Localisation(Node):
             return
 
         # ════════════════════════════════════════════════════════════════
-        # PASO 1 — PREDICCIÓN  (odometría + L_k dinámica)
+        # PASO 1 — PREDICCIÓN
         # ════════════════════════════════════════════════════════════════
-        self.Lk = np.matrix([
-            [self.K_R * abs(self.wr), 0.0                    ],
-            [0.0,                     self.K_L * abs(self.wl)],
-        ])
-
         v = (self.wr + self.wl) * self.r / 2.0
         w = (self.wr - self.wl) * self.r / self.L
 
-        # Jacobiano del modelo de movimiento respecto al estado
-        Hk = np.matrix([
-            [1, 0, -dt * v * math.sin(self.theta)],
-            [0, 1,  dt * v * math.cos(self.theta)],
-            [0, 0,  1],
-        ])
+        # L_k dinámica
+        self.Lk = np.array([
+            [self.K_R * abs(self.wr), 0.0                    ],
+            [0.0,                     self.K_L * abs(self.wl)],
+        ], dtype=float)
 
-        # Jacobiano del modelo de movimiento respecto a la entrada (ruido)
-        Fk = 0.5 * self.r * dt * np.matrix([
+        # Jacobiano H_k respecto al estado
+        Hk = np.array([
+            [1.0, 0.0, -v * math.sin(self.theta) * dt],
+            [0.0, 1.0,  v * math.cos(self.theta) * dt],
+            [0.0, 0.0,  1.0],
+        ], dtype=float)
+
+        # Jacobiano F_k respecto a la entrada
+        Fk = 0.5 * self.r * dt * np.array([
             [math.cos(self.theta),  math.cos(self.theta)],
             [math.sin(self.theta),  math.sin(self.theta)],
             [2.0 / self.L,         -2.0 / self.L        ],
-        ])
+        ], dtype=float)
 
         # Covarianza predicha
-        self.Ek = Hk * self.Ek * Hk.T + Fk * self.Lk * Fk.T
+        self.Ek = Hk @ self.Ek @ Hk.T + Fk @ self.Lk @ Fk.T
 
-        # Estado predicho  μ_k⁻
-        self.x     += v * math.cos(self.theta) * dt
-        self.y     += v * math.sin(self.theta) * dt
+        # ── Modelo cinemático EXACTO ─────────────────────────────────────
+        if abs(w) > 1e-6:
+            self.x += (v / w) * (math.sin(self.theta + w * dt) - math.sin(self.theta))
+            self.y += (v / w) * (-math.cos(self.theta + w * dt) + math.cos(self.theta))
+        else:
+            self.x += v * math.cos(self.theta) * dt
+            self.y += v * math.sin(self.theta) * dt
         self.theta += w * dt
+        self.theta  = math.atan2(math.sin(self.theta), math.cos(self.theta))
 
         # ════════════════════════════════════════════════════════════════
-        # PASO 2 — CORRECCIÓN  (ArUco — una iteración por marcador)
+        # PASO 2 — CORRECCIÓN ArUco
         # ════════════════════════════════════════════════════════════════
-        for (marker_id, d_k_raw, alpha_k_raw) in self._aruco_buf:
-
-            # -- Corrección de bias de la cámara -------------------------
-            d_k     = d_k_raw     / (1.0 + self.BIAS_D)   # / 1.2246
-            alpha_k = alpha_k_raw / (1.0 + self.BIAS_A)   # / 0.6105
-
-            # -- Posición conocida del ArUco en el mundo -----------------
-            mi = self.aruco_map[marker_id]
+        for (marker_id, d_k, alpha_k) in self._aruco_buf:
+            mi     = self.aruco_map[marker_id]
             x_mi, y_mi = mi[0], mi[1]
 
-            # -- Diferencias de posición (usando estado predicho μ_k⁻) ---
             dx = x_mi - self.x
             dy = y_mi - self.y
             d2 = dx**2 + dy**2
             d  = math.sqrt(d2)
 
-            if d < 1e-6:   # evitar división por cero
+            if d < 1e-6:
                 continue
 
-            # -- Modelo de observación esperado  y_k = g(m_i, μ_k⁻) -----
-            d_pred     =  d
-            alpha_pred =  math.atan2(dy, dx) - self.theta
+            # Predicción de la medición
+            d_pred     = d
+            alpha_pred = math.atan2(dy, dx) - self.theta
+            alpha_pred = math.atan2(math.sin(alpha_pred), math.cos(alpha_pred))
 
-            # Normalizar ángulo a [-π, π]
-            alpha_pred = math.atan2(math.sin(alpha_pred),
-                                    math.cos(alpha_pred))
-
-            # -- Jacobiano G_k  (2×3) — de la diapositiva ----------------
-            #
-            #  G_k = [ -dx/d        -dy/d         0  ]
-            #        [  dy/d²       -dx/d²        -1  ]
-            #
-            Gk = np.matrix([
+            # Jacobiano G_k (2×3)
+            Gk = np.array([
                 [-dx / d,   -dy / d,   0.0],
                 [ dy / d2,  -dx / d2, -1.0],
-            ])
+            ], dtype=float)
 
-            # -- Ganancia de Kalman K_k -----------------------------------
-            S  = Gk * self.Ek * Gk.T + self.Rk          # innovación covarianza
-            Kk = self.Ek * Gk.T * np.linalg.inv(S)      # 3×2
+            # Ganancia de Kalman
+            S  = Gk @ self.Ek @ Gk.T + self.Rk
+            try:
+                Kk = self.Ek @ Gk.T @ np.linalg.inv(S)
+            except np.linalg.LinAlgError:
+                self.get_logger().error(
+                    f'Matriz singular en corrección ArUco {marker_id}, saltando.')
+                continue
 
-            # -- Innovación  z_ik - g(m_i, μ_k⁻) ------------------------
+            # Innovación
             innov_d     = d_k - d_pred
             innov_alpha = alpha_k - alpha_pred
-            innov_alpha = math.atan2(math.sin(innov_alpha),
-                                     math.cos(innov_alpha))   # normalizar
+            innov_alpha = math.atan2(math.sin(innov_alpha), math.cos(innov_alpha))
 
-            innov = np.matrix([[innov_d],
-                               [innov_alpha]])
+            innov = np.array([[innov_d], [innov_alpha]], dtype=float)
 
-            # -- Actualización del estado --------------------------------
-            delta  = Kk * innov
-            self.x     += float(delta[0])
-            self.y     += float(delta[1])
+            # Actualización estado
+            delta      = Kk @ innov
+            self.x    += float(delta[0])
+            self.y    += float(delta[1])
             self.theta += float(delta[2])
-            self.theta  = math.atan2(math.sin(self.theta),
-                                     math.cos(self.theta))
+            self.theta  = math.atan2(math.sin(self.theta), math.cos(self.theta))
 
-            # -- Actualización de la covarianza --------------------------
-            I3         = np.eye(3)
-            self.Ek    = (I3 - Kk * Gk) * self.Ek
+            # Actualización covarianza
+            self.Ek = (np.eye(3) - Kk @ Gk) @ self.Ek
 
             self.get_logger().debug(
                 f'ArUco {marker_id} | d={d_k:.3f} α={math.degrees(alpha_k):.1f}° | '
                 f'Δx={float(delta[0]):+.4f} Δy={float(delta[1]):+.4f} '
                 f'Δθ={math.degrees(float(delta[2])):+.2f}°')
 
-        # Limpiar buffer tras procesar
         self._aruco_buf = []
 
         # ════════════════════════════════════════════════════════════════
-        # PUBLICAR  odom + TF
+        # PUBLICAR odom + TF
         # ════════════════════════════════════════════════════════════════
         q = quaternion_from_euler(0, 0, self.theta)
 
-        self.tf_msg.header.stamp            = now_stamp
-        self.tf_msg.transform.translation.x = self.x
-        self.tf_msg.transform.translation.y = self.y
-        self.tf_msg.transform.translation.z = 0.0
-        self.tf_msg.transform.rotation.x    = q[0]
-        self.tf_msg.transform.rotation.y    = q[1]
-        self.tf_msg.transform.rotation.z    = q[2]
-        self.tf_msg.transform.rotation.w    = q[3]
+        self.tf_msg.header.stamp             = now_stamp
+        self.tf_msg.transform.translation.x  = self.x
+        self.tf_msg.transform.translation.y  = self.y
+        self.tf_msg.transform.translation.z  = 0.0
+        self.tf_msg.transform.rotation.x     = q[0]
+        self.tf_msg.transform.rotation.y     = q[1]
+        self.tf_msg.transform.rotation.z     = q[2]
+        self.tf_msg.transform.rotation.w     = q[3]
 
-        self.odom.header.stamp              = now_stamp
-        self.odom.pose.pose.position.x      = self.x
-        self.odom.pose.pose.position.y      = self.y
-        self.odom.pose.pose.position.z      = 0.0
-        self.odom.pose.pose.orientation.x   = q[0]
-        self.odom.pose.pose.orientation.y   = q[1]
-        self.odom.pose.pose.orientation.z   = q[2]
-        self.odom.pose.pose.orientation.w   = q[3]
+        self.odom.header.stamp               = now_stamp
+        self.odom.pose.pose.position.x       = self.x
+        self.odom.pose.pose.position.y       = self.y
+        self.odom.pose.pose.position.z       = 0.0
+        self.odom.pose.pose.orientation.x    = q[0]
+        self.odom.pose.pose.orientation.y    = q[1]
+        self.odom.pose.pose.orientation.z    = q[2]
+        self.odom.pose.pose.orientation.w    = q[3]
 
         self.odom.pose.covariance[0]  = self.Ek[0, 0]
         self.odom.pose.covariance[1]  = self.Ek[0, 1]
@@ -337,6 +324,7 @@ def main(args=None):
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

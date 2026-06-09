@@ -51,7 +51,7 @@ class CenterAndApproach(Node):
 
         self.declare_parameter('stop_dist',    0.15)
         self.declare_parameter('center_thr',   0.05)
-        self.declare_parameter('yaw_thr',      0.3)
+        self.declare_parameter('yaw_thr',      0.4)
         self.declare_parameter('k_offset',    -0.3)
         self.declare_parameter('k_yaw',        0.8)
         self.declare_parameter('w_min',        0.10)
@@ -298,7 +298,7 @@ class CenterAndApproach(Node):
                 self._pick_step_start = now
                 self.get_logger().info('Avance completo → subiendo servo')
             else:
-                w = -self.k_offset * self._pick_offset_x * 5.0
+                w = -self.k_offset * self._pick_offset_x * 6.0
                 self._publish(self.PICK_SPEED, w)
 
         elif self._pick_step == self.PICK_RAISE:
