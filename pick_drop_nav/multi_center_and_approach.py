@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
 """
-center_and_approach.py
-----------------------
-Flujo interno:
-  idle        — esperando ArUco
-  centering   — gira hasta offset_x ≈ 0
-  approaching — avanza hasta stop_dist
-  aligning    — corrección final de yaw
-  picking     — secuencia: bajar servo → avanzar → subir servo → retroceder
-  depositing  — secuencia: bajar servo → retroceder → subir servo
-  done        — publica ca_status='done' y espera reset
+multi_center_and_approach.py
+-----------------------------
+Basado en el center_and_approach.py que funciona (versión sin go_to_perp).
+Único cambio: escucha /ca_target_id para saber qué ID de carga seguir.
 
-Integración con coordinador:
-  Suscribe  /mission_state  String  — actúa en 'pick' o 'deposit'
-  Publica   /ca_status      String  — 'idle' | 'running' | 'done'
-
-Regla de cmd_vel:
-  - Solo publica cuando está activamente ejecutando una fase
-  - picking y depositing se ejecutan hasta el final aunque mission_state cambie
-  - idle y done son silenciosos
+Flujo:
+  idle       — esperando ArUco del ID activo
+  centering  — gira hasta offset_x ≈ 0
+  approaching— avanza hasta stop_dist
+  aligning   — corrección final de yaw
+  picking    — bajar servo → avanzar → subir servo → retroceder
+  depositing — bajar servo → retroceder → subir servo
+  done       — publica ca_status='done'
 """
 
 import rclpy, math
@@ -35,10 +29,10 @@ class CenterAndApproach(Node):
     PICK_REVERSE = 'reverse'
     PICK_DONE    = 'pick_done'
 
-    DEP_LOWER    = 'dep_lower_servo'
-    DEP_REVERSE  = 'dep_reverse'
-    DEP_RAISE    = 'dep_raise_servo'
-    DEP_DONE     = 'dep_done'
+    DEP_LOWER   = 'dep_lower_servo'
+    DEP_REVERSE = 'dep_reverse'
+    DEP_RAISE   = 'dep_raise_servo'
+    DEP_DONE    = 'dep_done'
 
     SERVO_DOWN = 58.0
     SERVO_UP   = -80.0
@@ -71,11 +65,15 @@ class CenterAndApproach(Node):
         self.timeout      = self.get_parameter('timeout').value
         self.standalone   = self.get_parameter('standalone').value
 
+        # Subscripciones
         self.create_subscription(
             Float32MultiArray, '/aruco_target', self._aruco_cb, 10)
         self.create_subscription(
             String, '/mission_state', self._mission_cb, 10)
+        self.create_subscription(
+            String, '/ca_target_id', self._ca_id_cb, 10)
 
+        # Publishers
         self.pub      = self.create_publisher(Twist,   '/cmd_vel',    10)
         self.pub_srv  = self.create_publisher(Float32, '/ServoAngle', 10)
         self.pub_stat = self.create_publisher(String,  '/ca_status',  10)
@@ -91,19 +89,32 @@ class CenterAndApproach(Node):
         self._yaw_buf  = []
         self._YAW_N    = 5
 
+        # ID activo de carga (viene del coordinador)
+        self._active_id = None
+
         # Estado máquina
-        self._phase          = 'idle'
-        self._mission_active = self.standalone
-        self._deposit_active = False
-        self._pick_offset_x  = 0.0
-        self._pick_step      = None
+        self._phase           = 'idle'
+        self._mission_active  = self.standalone
+        self._deposit_active  = False
+        self._pick_offset_x   = 0.0
+        self._pick_step       = None
         self._pick_step_start = None
 
         self.get_logger().info(
-            f'Center & Approach | standalone={self.standalone} | '
+            f'Multi Center & Approach | standalone={self.standalone} | '
             f'stop={self.stop_dist} m | w_min={self.w_min}')
 
     # ── Callbacks ─────────────────────────────────────────────────────────
+    def _ca_id_cb(self, msg: String):
+        """Recibe el ID de carga activo del coordinador."""
+        try:
+            new_id = int(msg.data)
+            if new_id != self._active_id:
+                self._active_id = new_id
+                self.get_logger().info(f'ID de carga activo → {self._active_id}')
+        except ValueError:
+            pass
+
     def _mission_cb(self, msg: String):
         was_pick    = self._mission_active
         was_deposit = self._deposit_active
@@ -114,17 +125,22 @@ class CenterAndApproach(Node):
         # Freno solo si la secuencia NO está en curso
         if not self._mission_active and was_pick and self._phase not in ('picking',):
             self._stop()
-
         if not self._deposit_active and was_deposit and self._phase not in ('depositing',):
             self._stop()
 
-        # Activar pick
+        # Activar pick — solo resetear si estaba inactivo
+        _inactive = ('idle', 'done')
         if self._mission_active and not was_pick:
-            self._phase = 'idle'
-            self._yaw_buf.clear()
-            self.get_logger().info('Misión PICK activada → idle')
+            if self._phase in _inactive:
+                self._phase = 'idle'
+                self._yaw_buf.clear()
+                self.get_logger().info(
+                    f'Misión PICK activada → idle | ID={self._active_id}')
+            else:
+                self.get_logger().debug(
+                    f'PICK re-activado, fase={self._phase} en curso — sin reset')
 
-        # Activar deposit — inicia secuencia inmediatamente
+        # Activar deposit
         if self._deposit_active and not was_deposit:
             self._phase           = 'depositing'
             self._pick_step       = self.DEP_LOWER
@@ -148,7 +164,7 @@ class CenterAndApproach(Node):
         if self._phase == 'idle' and self._mission_active:
             self._phase = 'centering'
             self.get_logger().info(
-                f'ArUco detectado → centering | '
+                f'ArUco ID={self._active_id} detectado → centering | '
                 f'd={self._dist:.3f} m | offset={self._offset_x:+.3f}')
 
     def _aruco_visible(self):
@@ -187,9 +203,7 @@ class CenterAndApproach(Node):
 
     # ── Loop principal ────────────────────────────────────────────────────
     def _loop(self):
-
-        # ── Fases autónomas — se ejecutan hasta el final sin importar
-        #    mission_state. El coordinador espera ca_status='done'. ────────
+        # Fases autónomas — se ejecutan hasta el final
         if self._phase == 'picking':
             self._pub_status('running')
             self._do_picking()
@@ -201,14 +215,14 @@ class CenterAndApproach(Node):
             return
 
         if self._phase == 'done':
-            self._pub_status('done')   # silencioso en cmd_vel
+            self._pub_status('done')
             return
 
-        # ── Fases controladas por mission_state ───────────────────────────
+        # Fases controladas por mission_state
         active = self._mission_active or self._deposit_active or self.standalone
         if not active:
             self._pub_status('idle')
-            return   # silencio total en cmd_vel
+            return
 
         if not self._aruco_visible() and self._phase not in ('idle',):
             self.get_logger().warn('ArUco perdido → idle')
@@ -217,12 +231,12 @@ class CenterAndApproach(Node):
 
         self._pub_status('running' if self._phase != 'idle' else 'idle')
 
-        if   self._phase == 'idle':        pass   # silencio
+        if   self._phase == 'idle':        pass
         elif self._phase == 'centering':   self._do_centering()
         elif self._phase == 'approaching': self._do_approaching()
         elif self._phase == 'aligning':    self._do_aligning()
 
-    # ── Fase: centrar ─────────────────────────────────────────────────────
+    # ── Fases ─────────────────────────────────────────────────────────────
     def _do_centering(self):
         if abs(self._offset_x) < self.center_thr:
             self._phase = 'approaching'
@@ -235,7 +249,6 @@ class CenterAndApproach(Node):
         self.get_logger().info(
             f'[centering] offset={self._offset_x:+.3f} w={w:+.3f}')
 
-    # ── Fase: approach ────────────────────────────────────────────────────
     def _do_approaching(self):
         if self._dist <= self.stop_dist + self.brake_margin:
             self._stop()
@@ -252,7 +265,6 @@ class CenterAndApproach(Node):
             f'[approaching] d={self._dist:.3f} m | offset={self._offset_x:+.3f} '
             f'v={v:.3f} w={w:+.3f}')
 
-    # ── Fase: alineación final ────────────────────────────────────────────
     def _do_aligning(self):
         offset_ok = abs(self._offset_x) < self.center_thr
         yaw_ok    = abs(self._yaw)      < self.yaw_thr
@@ -277,7 +289,6 @@ class CenterAndApproach(Node):
             f'[aligning] offset={self._offset_x:+.3f} '
             f'yaw={math.degrees(self._yaw):+.1f}° w={w:+.3f}')
 
-    # ── Fase: picking ─────────────────────────────────────────────────────
     def _do_picking(self):
         now     = self._now()
         elapsed = now - self._pick_step_start
@@ -298,7 +309,7 @@ class CenterAndApproach(Node):
                 self._pick_step_start = now
                 self.get_logger().info('Avance completo → subiendo servo')
             else:
-                if abs(self._pick_offset_x) <= 0.05:
+                if abs(self._pick_offset_x) <= 0.03:
                     w = 0.0
                 else:
                     w = -self.k_offset * self._pick_offset_x * 5.0
@@ -322,13 +333,7 @@ class CenterAndApproach(Node):
             else:
                 self._publish(-self.PICK_SPEED, 0.0)
 
-    # ── Fase: depositing ──────────────────────────────────────────────────
     def _do_depositing(self):
-        """
-        1. Baja servo  (55°)  → suelta la carga
-        2. Retrocede 0.20 m   → se aleja dejando la carga
-        3. Sube servo  (-80°) → recoge el tenedor vacío
-        """
         now     = self._now()
         elapsed = now - self._pick_step_start
 

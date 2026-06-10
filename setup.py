@@ -30,6 +30,8 @@ setup(
             'center_and_approach = pick_drop_nav.center_and_approach:main',
             'localisation = pick_drop_nav.localisation:main',
             'center2 = pick_drop_nav.center2:main',
+            'multi_mission_coordinator = pick_drop_nav.multi_main_controller:main',
+            'multi_center_and_approach = pick_drop_nav.multi_center_and_approach:main',
         ],
     },
 )
