@@ -50,8 +50,8 @@ class BugAlgorithm(Node):
         self._wall_side     = None
         self.state          = 'stop_robot'
         self.k_linear       = 0.2
-        self.k_angular      = 1.0
-        self.turn_until     = 7/8 * math.pi
+        self.k_angular      = 0.5
+        self.turn_until     = 1/8 * math.pi
         self.current_pose   = []
         self.target_pose    = []
         self.got_new_target = False

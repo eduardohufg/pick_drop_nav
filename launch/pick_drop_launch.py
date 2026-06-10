@@ -68,7 +68,7 @@ def launch_setup(context, *args, **kwargs):
                 'K_L':    0.1110887664,
                 'r_dd':   0.1,
                 'r_aa':   0.1,
-                'aruco_map': '{"10": [-1.6, 0.0], "11": [1.6, 0.0], "2": [0.0, 1.6], "3": [0.0, -1.6]}',  # <-- editar IDs y coords aquí
+                'aruco_map': '{"10": [-1.6, 0.0], "11": [1.6, 0.0], "13": [0.0, 1.3], "14": [0.0, -1.3]}',  # <-- editar IDs y coords aquí
             }]
         ),
 
